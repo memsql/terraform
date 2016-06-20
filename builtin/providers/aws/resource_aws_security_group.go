@@ -237,8 +237,6 @@ func resourceAwsSecurityGroupCreate(d *schema.ResourceData, meta interface{}) er
 	// revoke that rule, so users don't unknowingly have/use it.
 	group := resp.(*ec2.SecurityGroup)
 	if group.VpcId != nil && *group.VpcId != "" {
-		log.Printf("[DEBUG] Revoking default egress rule for Security Group for %s", d.Id())
-
 		req := &ec2.RevokeSecurityGroupEgressInput{
 			GroupId: createResp.GroupId,
 			IpPermissions: []*ec2.IpPermission{
@@ -255,15 +253,28 @@ func resourceAwsSecurityGroupCreate(d *schema.ResourceData, meta interface{}) er
 			},
 		}
 
-		if _, err = conn.RevokeSecurityGroupEgress(req); err != nil {
-			return fmt.Errorf(
-				"Error revoking default egress rule for Security Group (%s): %s",
-				d.Id(), err)
-		}
+		err := resource.Retry(5*time.Minute, func() *resource.RetryError {
+			log.Printf("[DEBUG] Revoking security group %#v default egress rule", group)
+			if _, err := conn.RevokeSecurityGroupEgress(req); err != nil {
+				ec2err, ok := err.(awserr.Error)
+				if ok && strings.Contains(ec2err.Code(), ".NotFound") {
+					log.Printf("[INFO] RetryableError revoking security group %#v default egress rule: %s",
+						group, ec2err)
+					return resource.RetryableError(ec2err) // retry
+				}
+				log.Printf("[INFO] NonRetryableError revoking security group %#v default egress rule: %s",
+					group, err)
+				return resource.NonRetryableError(err)
+			}
+			return nil
+		})
 
+		if err != nil {
+			return err
+		}
 	}
 
-	return resourceAwsSecurityGroupUpdate(d, meta)
+	return resourceAwsSecurityGroupUpdateRulesAndTags(d, meta, group)
 }
 
 func resourceAwsSecurityGroupRead(d *schema.ResourceData, meta interface{}) error {
@@ -278,34 +289,8 @@ func resourceAwsSecurityGroupRead(d *schema.ResourceData, meta interface{}) erro
 		return nil
 	}
 
-	sg := sgRaw.(*ec2.SecurityGroup)
-
-	remoteIngressRules := resourceAwsSecurityGroupIPPermGather(d.Id(), sg.IpPermissions, sg.OwnerId)
-	remoteEgressRules := resourceAwsSecurityGroupIPPermGather(d.Id(), sg.IpPermissionsEgress, sg.OwnerId)
-
-	localIngressRules := d.Get("ingress").(*schema.Set).List()
-	localEgressRules := d.Get("egress").(*schema.Set).List()
-
-	// Loop through the local state of rules, doing a match against the remote
-	// ruleSet we built above.
-	ingressRules := matchRules("ingress", localIngressRules, remoteIngressRules)
-	egressRules := matchRules("egress", localEgressRules, remoteEgressRules)
-
-	d.Set("description", sg.Description)
-	d.Set("name", sg.GroupName)
-	d.Set("vpc_id", sg.VpcId)
-	d.Set("owner_id", sg.OwnerId)
-
-	if err := d.Set("ingress", ingressRules); err != nil {
-		log.Printf("[WARN] Error setting Ingress rule set for (%s): %s", d.Id(), err)
-	}
-
-	if err := d.Set("egress", egressRules); err != nil {
-		log.Printf("[WARN] Error setting Egress rule set for (%s): %s", d.Id(), err)
-	}
-
-	d.Set("tags", tagsToMap(sg.Tags))
-	return nil
+	group := sgRaw.(*ec2.SecurityGroup)
+	return resourceAwsSecurityGroupReadRulesAndTags(d, meta, group)
 }
 
 func resourceAwsSecurityGroupUpdate(d *schema.ResourceData, meta interface{}) error {
@@ -321,26 +306,7 @@ func resourceAwsSecurityGroupUpdate(d *schema.ResourceData, meta interface{}) er
 	}
 
 	group := sgRaw.(*ec2.SecurityGroup)
-
-	err = resourceAwsSecurityGroupUpdateRules(d, "ingress", meta, group)
-	if err != nil {
-		return err
-	}
-
-	if d.Get("vpc_id") != nil {
-		err = resourceAwsSecurityGroupUpdateRules(d, "egress", meta, group)
-		if err != nil {
-			return err
-		}
-	}
-
-	if err := setTags(conn, d); err != nil {
-		return err
-	}
-
-	d.SetPartial("tags")
-
-	return resourceAwsSecurityGroupRead(d, meta)
+	return resourceAwsSecurityGroupUpdateRulesAndTags(d, meta, group)
 }
 
 func resourceAwsSecurityGroupDelete(d *schema.ResourceData, meta interface{}) error {
@@ -483,6 +449,69 @@ func resourceAwsSecurityGroupIPPermGather(groupId string, permissions []*ec2.IpP
 	return rules
 }
 
+// resourceAwsSecurityGroupUpdateRulesAndTags performs the 'update' step for
+// this resource except for the initial check to see if this resource still
+// exists.
+func resourceAwsSecurityGroupUpdateRulesAndTags(
+	d *schema.ResourceData, meta interface{}, group *ec2.SecurityGroup) error {
+	conn := meta.(*AWSClient).ec2conn
+
+	err := resourceAwsSecurityGroupUpdateRules(d, "ingress", meta, group)
+	if err != nil {
+		return err
+	}
+
+	if d.Get("vpc_id") != nil {
+		err := resourceAwsSecurityGroupUpdateRules(d, "egress", meta, group)
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := setTags(conn, d); err != nil {
+		return err
+	}
+
+	d.SetPartial("tags")
+
+	return resourceAwsSecurityGroupReadRulesAndTags(d, meta, group)
+}
+
+// resourceAwsSecurityGroupReadRulesAndTags performs the 'read' step for this
+// resource except for the initial check to see if this resource still exists.
+func resourceAwsSecurityGroupReadRulesAndTags(
+	d *schema.ResourceData, meta interface{}, group *ec2.SecurityGroup) error {
+
+	remoteIngressRules := resourceAwsSecurityGroupIPPermGather(d.Id(), group.IpPermissions, group.OwnerId)
+	remoteEgressRules := resourceAwsSecurityGroupIPPermGather(d.Id(), group.IpPermissionsEgress, group.OwnerId)
+
+	localIngressRules := d.Get("ingress").(*schema.Set).List()
+	localEgressRules := d.Get("egress").(*schema.Set).List()
+
+	// Loop through the local state of rules, doing a match against the remote
+	// ruleSet we built above.
+	ingressRules := matchRules("ingress", localIngressRules, remoteIngressRules)
+	egressRules := matchRules("egress", localEgressRules, remoteEgressRules)
+
+	d.Set("description", group.Description)
+	d.Set("name", group.GroupName)
+	d.Set("vpc_id", group.VpcId)
+	d.Set("owner_id", group.OwnerId)
+
+	if err := d.Set("ingress", ingressRules); err != nil {
+		log.Printf("[WARN] Error setting Ingress rule set for (%s): %s", d.Id(), err)
+	}
+
+	if err := d.Set("egress", egressRules); err != nil {
+		log.Printf("[WARN] Error setting Egress rule set for (%s): %s", d.Id(), err)
+	}
+
+	d.Set("tags", tagsToMap(group.Tags))
+	return nil
+}
+
+// resourceAwsSecurityGroupUpdateRules applies all 'add' and 'remove' changes
+// for the given ruleset (either 'ingress' or 'egress').
 func resourceAwsSecurityGroupUpdateRules(
 	d *schema.ResourceData, ruleset string,
 	meta interface{}, group *ec2.SecurityGroup) error {
@@ -520,63 +549,102 @@ func resourceAwsSecurityGroupUpdateRules(
 		if len(remove) > 0 || len(add) > 0 {
 			conn := meta.(*AWSClient).ec2conn
 
-			var err error
 			if len(remove) > 0 {
-				log.Printf("[DEBUG] Revoking security group %#v %s rule: %#v",
-					group, ruleset, remove)
-
+				var revokeFunc func() error
 				if ruleset == "egress" {
-					req := &ec2.RevokeSecurityGroupEgressInput{
-						GroupId:       group.GroupId,
-						IpPermissions: remove,
+					revokeFunc = func() error {
+						req := &ec2.RevokeSecurityGroupEgressInput{
+							GroupId:       group.GroupId,
+							IpPermissions: remove,
+						}
+						_, err := conn.RevokeSecurityGroupEgress(req)
+						return err
 					}
-					_, err = conn.RevokeSecurityGroupEgress(req)
 				} else {
-					req := &ec2.RevokeSecurityGroupIngressInput{
-						GroupId:       group.GroupId,
-						IpPermissions: remove,
+					revokeFunc = func() error {
+						req := &ec2.RevokeSecurityGroupIngressInput{
+							GroupId:       group.GroupId,
+							IpPermissions: remove,
+						}
+						if group.VpcId == nil || *group.VpcId == "" {
+							req.GroupId = nil
+							req.GroupName = group.GroupName
+						}
+						_, err := conn.RevokeSecurityGroupIngress(req)
+						return err
 					}
-					if group.VpcId == nil || *group.VpcId == "" {
-						req.GroupId = nil
-						req.GroupName = group.GroupName
-					}
-					_, err = conn.RevokeSecurityGroupIngress(req)
 				}
 
+				err := resource.Retry(5*time.Minute, func() *resource.RetryError {
+					log.Printf("[DEBUG] Revoking security group %#v %s rule: %#v",
+						group, ruleset, remove)
+					err := revokeFunc()
+					if err != nil {
+						ec2err, ok := err.(awserr.Error)
+						if ok && strings.Contains(ec2err.Code(), ".NotFound") {
+							log.Printf("[INFO] RetryableError revoking security group %#v %s rule: %s",
+								group, ruleset, ec2err)
+							return resource.RetryableError(ec2err) // retry
+						}
+						log.Printf("[INFO] NonRetryableError revoking security group %#v %s rule: %s",
+							group, ruleset, err)
+						return resource.NonRetryableError(err)
+					}
+					return nil
+				})
+
 				if err != nil {
-					return fmt.Errorf(
-						"Error revoking security group %s rules: %s",
-						ruleset, err)
+					return err
 				}
 			}
 
 			if len(add) > 0 {
-				log.Printf("[DEBUG] Authorizing security group %#v %s rule: %#v",
-					group, ruleset, add)
-				// Authorize the new rules
+				var authorizeFunc func() error
 				if ruleset == "egress" {
-					req := &ec2.AuthorizeSecurityGroupEgressInput{
-						GroupId:       group.GroupId,
-						IpPermissions: add,
+					authorizeFunc = func() error {
+						req := &ec2.AuthorizeSecurityGroupEgressInput{
+							GroupId:       group.GroupId,
+							IpPermissions: add,
+						}
+						_, err := conn.AuthorizeSecurityGroupEgress(req)
+						return err
 					}
-					_, err = conn.AuthorizeSecurityGroupEgress(req)
 				} else {
-					req := &ec2.AuthorizeSecurityGroupIngressInput{
-						GroupId:       group.GroupId,
-						IpPermissions: add,
+					authorizeFunc = func() error {
+						req := &ec2.AuthorizeSecurityGroupIngressInput{
+							GroupId:       group.GroupId,
+							IpPermissions: add,
+						}
+						if group.VpcId == nil || *group.VpcId == "" {
+							req.GroupId = nil
+							req.GroupName = group.GroupName
+						}
+						_, err := conn.AuthorizeSecurityGroupIngress(req)
+						return err
 					}
-					if group.VpcId == nil || *group.VpcId == "" {
-						req.GroupId = nil
-						req.GroupName = group.GroupName
-					}
-
-					_, err = conn.AuthorizeSecurityGroupIngress(req)
 				}
 
+				// Authorize the new rules
+				err := resource.Retry(5*time.Minute, func() *resource.RetryError {
+					log.Printf("[DEBUG] Authorizing security group %#v %s rule: %#v",
+						group, ruleset, add)
+					err := authorizeFunc()
+					if err != nil {
+						ec2err, ok := err.(awserr.Error)
+						if ok && strings.Contains(ec2err.Code(), ".NotFound") {
+							log.Printf("[INFO] RetryableError authorizing security group %#v %s rule: %s",
+								group, ruleset, ec2err)
+							return resource.RetryableError(ec2err) // retry
+						}
+						log.Printf("[INFO] NonRetryableError authorizing security group %#v %s rule: %s",
+							group, ruleset, err)
+						return resource.NonRetryableError(err)
+					}
+					return nil
+				})
+
 				if err != nil {
-					return fmt.Errorf(
-						"Error authorizing security group %s rules: %s",
-						ruleset, err)
+					return err
 				}
 			}
 		}
